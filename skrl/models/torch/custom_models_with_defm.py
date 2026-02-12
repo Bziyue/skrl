@@ -5,7 +5,7 @@ This module provides Policy and Value networks that use DeFM's pretrained ResNet
 backbone for processing depth images. The backbone is frozen and P4 features are extracted.
 
 Input:
-    - 4 x 64x64 depth images (arranged as 2x2 grid -> 128x128)
+    - 4 x 64x32 depth images (arranged as 2x2 grid -> 128x64)
     - State vector
 
 Output:
@@ -41,6 +41,8 @@ class DeFMBackbone(nn.Module):
     - Loads pretrained weights and freezes all parameters
     - Extracts P4 features (stride 16) from BiFPN output
     - Preprocesses raw depth images using DeFM's metric-aware normalization
+    
+    Input: 4 x 64x32 depth images -> 2x2 grid -> 128x64 -> P4 (8x4)
     """
     
     def __init__(
@@ -79,16 +81,16 @@ class DeFMBackbone(nn.Module):
         self.backbone = self.backbone.to(self.device)
         
         # Compute output dimension using dummy input
-        # Input: 4 x 128x128 depth images -> 256x256 grid
-        dummy_input = torch.zeros(1, 3, 256, 256).to(self.device)
+        # Input: 4 x 64x32 depth images -> 128x64 grid
+        dummy_input = torch.zeros(1, 3, 128, 64).to(self.device)
         
         with torch.no_grad():
             out_dict = self.backbone(dummy_input)
             p4_feat = out_dict["dense_bifpn"]["P4"]
             # Store spatial shape info: (channels, H, W)
             self.p4_channels = p4_feat.shape[1]   # 128
-            self.p4_h = p4_feat.shape[2]           # 16
-            self.p4_w = p4_feat.shape[3]           # 16
+            self.p4_h = p4_feat.shape[2]           # 8 (128/16)
+            self.p4_w = p4_feat.shape[3]           # 4 (64/16)
             
             print(f"[DeFM Backbone] P4 Feature Shape: {p4_feat.shape}")
             print(f"[DeFM Backbone] P4 Channels: {self.p4_channels}, Spatial: {self.p4_h}x{self.p4_w}")
@@ -98,10 +100,10 @@ class DeFMBackbone(nn.Module):
         Forward pass through DeFM backbone.
         
         Args:
-            x: Preprocessed depth tensor of shape (N, 3, 256, 256)
+            x: Preprocessed depth tensor of shape (N, 3, 128, 64)
         
         Returns:
-            P4 features of shape (N, 128, 16, 16) - preserving spatial dimensions
+            P4 features of shape (N, 128, 8, 4) - preserving spatial dimensions
         """
         with torch.no_grad():
             out_dict = self.backbone(x)
@@ -115,16 +117,16 @@ def preprocess_depth_grid(
     """
     Preprocess 4 depth images into DeFM format.
     
-    Takes 4 x 128x128 raw depth images, arranges them into a 2x2 grid (256x256),
+    Takes 4 x 64x32 raw depth images, arranges them into a 2x2 grid (128x64),
     then applies DeFM's metric-aware 3-channel normalization.
     
     Args:
-        depth_images: Raw depth tensor of shape (N, 4, 128, 128) 
+        depth_images: Raw depth tensor of shape (N, 4, 64, 32) 
                       where 4 cameras are: [front, right, back, left]
         device: Target device
     
     Returns:
-        Preprocessed tensor of shape (N, 3, 256, 256)
+        Preprocessed tensor of shape (N, 3, 128, 64)
     """
     N = depth_images.shape[0]
     
@@ -132,22 +134,22 @@ def preprocess_depth_grid(
     # Layout:  front  | right
     #          -------+-------
     #          back   | left
-    front = depth_images[:, 0]  # (N, 128, 128)
+    front = depth_images[:, 0]  # (N, 64, 32)
     right = depth_images[:, 1]
     back = depth_images[:, 2]
     left = depth_images[:, 3]
     
-    # Create 256x256 grid
-    top_row = torch.cat([front, right], dim=2)     # (N, 128, 256)
-    bottom_row = torch.cat([back, left], dim=2)    # (N, 128, 256)
-    grid = torch.cat([top_row, bottom_row], dim=1) # (N, 256, 256)
+    # Create 128x64 grid (H=128, W=64)
+    top_row = torch.cat([front, right], dim=2)     # (N, 64, 64)
+    bottom_row = torch.cat([back, left], dim=2)    # (N, 64, 64)
+    grid = torch.cat([top_row, bottom_row], dim=1) # (N, 128, 64)
     
     # Apply DeFM preprocessing (metric-aware 3-channel normalization)
-    # Input: (N, 256, 256) raw metric depth
-    # Output: (N, 3, 256, 256) normalized
+    # Input: (N, 128, 64) raw metric depth
+    # Output: (N, 3, 128, 64) normalized
     processed = preprocess_depth_batch(
         grid,
-        target_size=256,
+        target_size=(128, 64),  # (H, W)
         cnn_padding=False,
         device=device,
     )
@@ -233,7 +235,7 @@ class DeFMPolicy(GaussianMixin, Model):
         
         # 1. Parse input space dimensions
         # observation_space is a Dict with "image" and "state"
-        # image shape: (4, 128, 128) -> 4 cameras, 128x128 each
+        # image shape: (4, 64, 32) -> 4 cameras, 64x32 each
         image_shape = observation_space["image"].shape
         state_shape = observation_space["state"].shape
         action_shape = action_space.shape
@@ -256,23 +258,16 @@ class DeFMPolicy(GaussianMixin, Model):
             freeze=True,
         )
         
-        # 3. Spatial adapter: 1x1 conv to compress P4 channels (128 -> 8)
-        #    Keeps spatial resolution (16x16), then flatten -> 8*16*16 = 2048
-        p4_ch = self.defm_backbone.p4_channels  # 128
-        adapter_out_ch = 8
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(p4_ch, adapter_out_ch, kernel_size=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        adapter_out_dim = adapter_out_ch * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 8*16*16=2048
+        # 3. Flatten layer: P4 features (N, 128, 8, 4) -> (N, 4096)
+        #    No 1x1 conv, directly flatten P4 features
+        self.flatten = nn.Flatten()
+        p4_feat_dim = self.defm_backbone.p4_channels * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 128*8*4=4096
         
-        print(f"[DeFM Policy] Spatial adapter: {p4_ch}ch -> {adapter_out_ch}ch, "
-              f"flatten -> {adapter_out_dim}")
+        print(f"[DeFM Policy] P4 flatten dim: {p4_feat_dim}")
         
-        # 4. Define MLP (adapter features + state -> action)
+        # 4. Define MLP (flattened P4 features + state -> action)
         self.mlp = nn.Sequential(
-            nn.Linear(adapter_out_dim + state_dim, 512),
+            nn.Linear(p4_feat_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -293,7 +288,7 @@ class DeFMPolicy(GaussianMixin, Model):
             requires_grad=not fixed_log_std
         )
         
-        print(f"[DeFM Policy] MLP input dim: {adapter_out_dim + state_dim}")
+        print(f"[DeFM Policy] MLP input dim: {p4_feat_dim + state_dim}")
         print(f"[DeFM Policy] MLP output dim: {action_dim}")
     
     def compute(self, inputs, role=""):
@@ -301,17 +296,17 @@ class DeFMPolicy(GaussianMixin, Model):
         observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
         
         # Get raw depth images and state
-        raw_depth = observations["image"]   # (N, 4, 128, 128)
+        raw_depth = observations["image"]   # (N, 4, 64, 32)
         state = observations["state"]       # (N, state_dim)
         
         # Backbone forward under no_grad: frozen params don't need gradients,
         # and skipping activation storage saves significant GPU memory.
         with torch.no_grad():
             processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
-            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 16, 16)
+            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 8, 4)
         
-        # Compress via spatial adapter (N, 128, 16, 16) -> (N, 2048)
-        img_features = self.spatial_adapter(p4_features)
+        # Flatten P4 features (N, 128, 8, 4) -> (N, 4096)
+        img_features = self.flatten(p4_features)
         
         # Combine features and compute action
         combined_features = torch.cat([img_features, state], dim=1)
@@ -374,6 +369,7 @@ class DeFMValue(DeterministicMixin, Model):
         
         # 1. Parse input space dimensions
         # state_space is a Dict with "image" and "state" (for critic)
+        # image shape: (4, 64, 32) -> 4 cameras, 64x32 each
         image_shape = state_space["image"].shape
         state_shape = state_space["state"].shape
         
@@ -393,23 +389,16 @@ class DeFMValue(DeterministicMixin, Model):
             freeze=True,
         )
         
-        # 3. Spatial adapter: 1x1 conv to compress P4 channels (128 -> 8)
-        #    Keeps spatial resolution (16x16), then flatten -> 8*16*16 = 2048
-        p4_ch = self.defm_backbone.p4_channels  # 128
-        adapter_out_ch = 8
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(p4_ch, adapter_out_ch, kernel_size=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        adapter_out_dim = adapter_out_ch * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 8*16*16=2048
+        # 3. Flatten layer: P4 features (N, 128, 8, 4) -> (N, 4096)
+        #    No 1x1 conv, directly flatten P4 features
+        self.flatten = nn.Flatten()
+        p4_feat_dim = self.defm_backbone.p4_channels * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 128*8*4=4096
         
-        print(f"[DeFM Value] Spatial adapter: {p4_ch}ch -> {adapter_out_ch}ch, "
-              f"flatten -> {adapter_out_dim}")
+        print(f"[DeFM Value] P4 flatten dim: {p4_feat_dim}")
         
-        # 4. Define MLP (adapter features + state -> value)
+        # 4. Define MLP (flattened P4 features + state -> value)
         self.mlp = nn.Sequential(
-            nn.Linear(adapter_out_dim + state_dim, 512),
+            nn.Linear(p4_feat_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -424,23 +413,23 @@ class DeFMValue(DeterministicMixin, Model):
             nn.Linear(64, 1)  # Output scalar value
         )
         
-        print(f"[DeFM Value] MLP input dim: {adapter_out_dim + state_dim}")
+        print(f"[DeFM Value] MLP input dim: {p4_feat_dim + state_dim}")
         print(f"[DeFM Value] MLP output dim: 1")
     
     def compute(self, inputs, role=""):
         # Unflatten states (critic uses state_space)
         states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
         
-        raw_depth = states["image"]   # (N, 4, 128, 128)
+        raw_depth = states["image"]   # (N, 4, 64, 32)
         state = states["state"]       # (N, state_dim)
         
         # Backbone forward under no_grad to save GPU memory
         with torch.no_grad():
             processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
-            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 16, 16)
+            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 8, 4)
         
-        # Compress via spatial adapter (N, 128, 16, 16) -> (N, 2048)
-        img_features = self.spatial_adapter(p4_features)
+        # Flatten P4 features (N, 128, 8, 4) -> (N, 4096)
+        img_features = self.flatten(p4_features)
         
         # Combine features and compute value
         combined_features = torch.cat([img_features, state], dim=1)
