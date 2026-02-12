@@ -102,6 +102,9 @@ class Runner:
         from skrl.models.torch.custom_models import (
             CNNMLPPolicy, CNNMLPValue
         )
+        from skrl.models.torch.custom_models_with_defm import (
+            DeFMPolicy, DeFMValue
+        )
 
         component = {
             # models
@@ -114,6 +117,8 @@ class Runner:
             # custom models
             "cnnmlppolicy": CNNMLPPolicy,
             "cnnmlpvalue": CNNMLPValue,
+            "defmpolicy": DeFMPolicy,
+            "defmvalue": DeFMValue,
             # memories
             "randommemory": RandomMemory,
             # agents
