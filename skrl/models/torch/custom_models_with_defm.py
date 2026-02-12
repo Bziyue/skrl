@@ -85,25 +85,27 @@ class DeFMBackbone(nn.Module):
         with torch.no_grad():
             out_dict = self.backbone(dummy_input)
             p4_feat = out_dict["dense_bifpn"]["P4"]
-            self.output_dim = torch.flatten(p4_feat, start_dim=1).shape[1]
+            # Store spatial shape info: (channels, H, W)
+            self.p4_channels = p4_feat.shape[1]   # 128
+            self.p4_h = p4_feat.shape[2]           # 16
+            self.p4_w = p4_feat.shape[3]           # 16
             
             print(f"[DeFM Backbone] P4 Feature Shape: {p4_feat.shape}")
-            print(f"[DeFM Backbone] Flattened Output Dim: {self.output_dim}")
+            print(f"[DeFM Backbone] P4 Channels: {self.p4_channels}, Spatial: {self.p4_h}x{self.p4_w}")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through DeFM backbone.
         
         Args:
-            x: Preprocessed depth tensor of shape (N, 3, 128, 128)
+            x: Preprocessed depth tensor of shape (N, 3, 256, 256)
         
         Returns:
-            Flattened P4 features of shape (N, output_dim)
+            P4 features of shape (N, 128, 16, 16) - preserving spatial dimensions
         """
         with torch.no_grad():
             out_dict = self.backbone(x)
-            p4_feat = out_dict["dense_bifpn"]["P4"]
-            return torch.flatten(p4_feat, start_dim=1)
+            return out_dict["dense_bifpn"]["P4"]
 
 
 def preprocess_depth_grid(
@@ -253,11 +255,24 @@ class DeFMPolicy(GaussianMixin, Model):
             device=device,
             freeze=True,
         )
-        backbone_out_dim = self.defm_backbone.output_dim
         
-        # 3. Define MLP (backbone features + state -> action)
+        # 3. Spatial adapter: 1x1 conv to compress P4 channels (128 -> 8)
+        #    Keeps spatial resolution (16x16), then flatten -> 8*16*16 = 2048
+        p4_ch = self.defm_backbone.p4_channels  # 128
+        adapter_out_ch = 8
+        self.spatial_adapter = nn.Sequential(
+            nn.Conv2d(p4_ch, adapter_out_ch, kernel_size=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        adapter_out_dim = adapter_out_ch * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 8*16*16=2048
+        
+        print(f"[DeFM Policy] Spatial adapter: {p4_ch}ch -> {adapter_out_ch}ch, "
+              f"flatten -> {adapter_out_dim}")
+        
+        # 4. Define MLP (adapter features + state -> action)
         self.mlp = nn.Sequential(
-            nn.Linear(backbone_out_dim + state_dim, 512),
+            nn.Linear(adapter_out_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -272,13 +287,13 @@ class DeFMPolicy(GaussianMixin, Model):
             nn.Linear(64, action_dim)
         )
         
-        # 4. Learnable log_std parameter
+        # 5. Learnable log_std parameter
         self.log_std_parameter = nn.Parameter(
             torch.full(size=action_space.shape, fill_value=float(initial_log_std), dtype=torch.float32),
             requires_grad=not fixed_log_std
         )
         
-        print(f"[DeFM Policy] MLP input dim: {backbone_out_dim + state_dim}")
+        print(f"[DeFM Policy] MLP input dim: {adapter_out_dim + state_dim}")
         print(f"[DeFM Policy] MLP output dim: {action_dim}")
     
     def compute(self, inputs, role=""):
@@ -286,16 +301,17 @@ class DeFMPolicy(GaussianMixin, Model):
         observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
         
         # Get raw depth images and state
-        # Expected image shape: (N, 4, 128, 128) - 4 cameras, 128x128 each
-        raw_depth = observations["image"]  # (N, 4, 128, 128)
-        state = observations["state"]      # (N, state_dim)
+        raw_depth = observations["image"]   # (N, 4, 128, 128)
+        state = observations["state"]       # (N, state_dim)
         
-        # Preprocess depth images for DeFM
-        # This creates 2x2 grid and applies metric-aware normalization
-        processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
+        # Backbone forward under no_grad: frozen params don't need gradients,
+        # and skipping activation storage saves significant GPU memory.
+        with torch.no_grad():
+            processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
+            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 16, 16)
         
-        # Extract features from DeFM backbone
-        img_features = self.defm_backbone(processed_depth)
+        # Compress via spatial adapter (N, 128, 16, 16) -> (N, 2048)
+        img_features = self.spatial_adapter(p4_features)
         
         # Combine features and compute action
         combined_features = torch.cat([img_features, state], dim=1)
@@ -376,11 +392,24 @@ class DeFMValue(DeterministicMixin, Model):
             device=device,
             freeze=True,
         )
-        backbone_out_dim = self.defm_backbone.output_dim
         
-        # 3. Define MLP (backbone features + state -> value)
+        # 3. Spatial adapter: 1x1 conv to compress P4 channels (128 -> 8)
+        #    Keeps spatial resolution (16x16), then flatten -> 8*16*16 = 2048
+        p4_ch = self.defm_backbone.p4_channels  # 128
+        adapter_out_ch = 8
+        self.spatial_adapter = nn.Sequential(
+            nn.Conv2d(p4_ch, adapter_out_ch, kernel_size=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        adapter_out_dim = adapter_out_ch * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 8*16*16=2048
+        
+        print(f"[DeFM Value] Spatial adapter: {p4_ch}ch -> {adapter_out_ch}ch, "
+              f"flatten -> {adapter_out_dim}")
+        
+        # 4. Define MLP (adapter features + state -> value)
         self.mlp = nn.Sequential(
-            nn.Linear(backbone_out_dim + state_dim, 512),
+            nn.Linear(adapter_out_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -395,22 +424,23 @@ class DeFMValue(DeterministicMixin, Model):
             nn.Linear(64, 1)  # Output scalar value
         )
         
-        print(f"[DeFM Value] MLP input dim: {backbone_out_dim + state_dim}")
+        print(f"[DeFM Value] MLP input dim: {adapter_out_dim + state_dim}")
         print(f"[DeFM Value] MLP output dim: 1")
     
     def compute(self, inputs, role=""):
         # Unflatten states (critic uses state_space)
         states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
         
-        # Get raw depth images and state
-        raw_depth = states["image"]  # (N, 4, 128, 128)
-        state = states["state"]      # (N, state_dim)
+        raw_depth = states["image"]   # (N, 4, 128, 128)
+        state = states["state"]       # (N, state_dim)
         
-        # Preprocess depth images for DeFM
-        processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
+        # Backbone forward under no_grad to save GPU memory
+        with torch.no_grad():
+            processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
+            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 16, 16)
         
-        # Extract features from DeFM backbone
-        img_features = self.defm_backbone(processed_depth)
+        # Compress via spatial adapter (N, 128, 16, 16) -> (N, 2048)
+        img_features = self.spatial_adapter(p4_features)
         
         # Combine features and compute value
         combined_features = torch.cat([img_features, state], dim=1)
