@@ -451,9 +451,11 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "ppo_rnn", "rpo", "sac", "td3", "trpo"]:
             agent_id = possible_agents[0]
-            agent_cfg = dataclasses.asdict(self._component(f"{agent_class}_CFG")(**self._process_cfg(cfg["agent"])))
+            # PPO_RNN shares PPO_CFG in skrl
+            agent_cfg_component = "ppo_CFG" if agent_class == "ppo_rnn" else f"{agent_class}_CFG"
+            agent_cfg = dataclasses.asdict(self._component(agent_cfg_component)(**self._process_cfg(cfg["agent"])))
             agent_cfg.get("observation_preprocessor_kwargs", {}).update(
                 {"size": observation_spaces[agent_id], "device": device}
             )

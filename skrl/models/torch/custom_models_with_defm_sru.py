@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Literal
 
 import gymnasium
+from gymnasium import spaces
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,28 @@ def _prepare_height_tensor(height: torch.Tensor, model_name: str) -> torch.Tenso
     if height.ndim == 4:
         return height
     raise ValueError(f"{model_name} expects height as (B,H,W) or (B,C,H,W), got {tuple(height.shape)}")
+
+
+def _space_keys(space_obj) -> set[str]:
+    if isinstance(space_obj, spaces.Dict):
+        return set(space_obj.spaces.keys())
+    if isinstance(space_obj, dict):
+        return set(space_obj.keys())
+    return set()
+
+
+def _space_get(space_obj, key: str):
+    if isinstance(space_obj, spaces.Dict):
+        return space_obj.spaces[key]
+    return space_obj[key]
+
+
+def _unwrap_critic_space(state_space_obj):
+    """Unwrap possible {'critic': {...}} layout into critic inner space."""
+    keys = _space_keys(state_space_obj)
+    if "critic" in keys and "image" not in keys:
+        return _space_get(state_space_obj, "critic")
+    return state_space_obj
 
 
 class _SRUMemoryCore(nn.Module):
@@ -76,6 +99,9 @@ class _SRUMemoryCore(nn.Module):
         reference: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rnn_states = inputs.get("rnn", None)
+        # Runner.init_state_dict() doesn't provide recurrent states; bootstrap with zeros.
+        if rnn_states is None:
+            return self._init_state(target_batch, reference)
         if not isinstance(rnn_states, list) or len(rnn_states) != 2:
             raise ValueError("inputs['rnn'] must be [h, c] for SRU models")
 
@@ -323,14 +349,18 @@ class DeFMSRUValue(DeterministicMixin, Model):
         )
         DeterministicMixin.__init__(self, clip_actions=clip_actions, role=role)
 
+        self._critic_state_space = _unwrap_critic_space(state_space)
+        critic_space_keys = _space_keys(self._critic_state_space)
         for key in ("image", "state", "height", "time"):
-            if key not in state_space:
-                raise ValueError(f"DeFMSRUValue requires state_space['{key}']")
+            if key not in critic_space_keys:
+                raise ValueError(
+                    f"DeFMSRUValue requires critic state keys image/state/height/time, got keys={sorted(critic_space_keys)}"
+                )
 
-        image_shape = state_space["image"].shape
-        state_dim = state_space["state"].shape[0]
-        height_shape = state_space["height"].shape
-        time_dim = state_space["time"].shape[0]
+        image_shape = _space_get(self._critic_state_space, "image").shape
+        state_dim = _space_get(self._critic_state_space, "state").shape[0]
+        height_shape = _space_get(self._critic_state_space, "height").shape
+        time_dim = _space_get(self._critic_state_space, "time").shape[0]
         num_cameras, img_height, img_width = _parse_image_shape(image_shape, "DeFMSRUValue")
         if len(height_shape) == 2:
             height_channels = 1
@@ -387,6 +417,8 @@ class DeFMSRUValue(DeterministicMixin, Model):
 
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
+        if isinstance(states, dict) and "critic" in states:
+            states = states["critic"]
         raw_depth = states["image"]
         proprio = states["state"]
         height = states["height"]
