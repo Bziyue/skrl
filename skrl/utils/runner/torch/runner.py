@@ -105,6 +105,9 @@ class Runner:
         from skrl.models.torch.custom_models_with_defm import (
             DeFMPolicy, DeFMValue
         )
+        from skrl.models.torch.custom_models_with_defm_sru import (
+            DeFMSRUPolicy, DeFMSRUValue
+        )
 
         component = {
             # models
@@ -119,6 +122,8 @@ class Runner:
             "cnnmlpvalue": CNNMLPValue,
             "defmpolicy": DeFMPolicy,
             "defmvalue": DeFMValue,
+            "defmsrupolicy": DeFMSRUPolicy,
+            "defmsruvalue": DeFMSRUValue,
             # memories
             "randommemory": RandomMemory,
             # agents
