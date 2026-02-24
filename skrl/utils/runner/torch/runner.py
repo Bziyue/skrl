@@ -81,7 +81,7 @@ class Runner:
         from skrl.agents.torch.ddpg import DDPG, DDPG_CFG
         from skrl.agents.torch.ddqn import DDQN, DDQN_CFG
         from skrl.agents.torch.dqn import DQN, DQN_CFG
-        from skrl.agents.torch.ppo import PPO, PPO_CFG
+        from skrl.agents.torch.ppo import PPO, PPO_CFG, PPO_RNN
         from skrl.agents.torch.rpo import RPO, RPO_CFG
         from skrl.agents.torch.sac import SAC, SAC_CFG
         from skrl.agents.torch.td3 import TD3, TD3_CFG
@@ -140,6 +140,7 @@ class Runner:
             "dqn": DQN,
             "dqn_cfg": DQN_CFG,
             "ppo": PPO,
+            "ppo_rnn": PPO_RNN,
             "ppo_cfg": PPO_CFG,
             "rpo": RPO,
             "rpo_cfg": RPO_CFG,
