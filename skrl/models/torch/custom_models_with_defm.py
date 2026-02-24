@@ -5,7 +5,7 @@ This module provides Policy and Value networks that use DeFM's pretrained ResNet
 backbone for processing depth images. The backbone is frozen and P4 features are extracted.
 
 Input:
-    - 4 x 64x32 depth images (arranged as 2x2 grid -> 128x64)
+    - 4 x 64x32 depth images (processed independently, then fused at feature level)
     - State vector
 
 Output:
@@ -27,7 +27,7 @@ from skrl.utils.spaces.torch import unflatten_tensorized_space
 
 # DeFM imports
 from defm.model_factory import create_defm_model
-from defm.utils.utils import preprocess_depth_batch
+from defm.utils.utils import preprocess_depth_independent as defm_preprocess_depth_independent
 
 
 # Get path to DeFM weights directory
@@ -42,7 +42,7 @@ class DeFMBackbone(nn.Module):
     - Extracts P4 features (stride 16) from BiFPN output
     - Preprocesses raw depth images using DeFM's metric-aware normalization
     
-    Input: 4 x 64x32 depth images -> 2x2 grid -> 128x64 -> P4 (8x4)
+    Input: single-camera DeFM input (N, 3, 64, 32) -> P4 (4x2)
     """
     
     def __init__(
@@ -80,17 +80,16 @@ class DeFMBackbone(nn.Module):
         # Move to device
         self.backbone = self.backbone.to(self.device)
         
-        # Compute output dimension using dummy input
-        # Input: 4 x 64x32 depth images -> 128x64 grid
-        dummy_input = torch.zeros(1, 3, 128, 64).to(self.device)
+        # Compute output dimension using dummy input (single camera resolution)
+        dummy_input = torch.zeros(1, 3, 64, 32).to(self.device)
         
         with torch.no_grad():
             out_dict = self.backbone(dummy_input)
             p4_feat = out_dict["dense_bifpn"]["P4"]
             # Store spatial shape info: (channels, H, W)
             self.p4_channels = p4_feat.shape[1]   # 128
-            self.p4_h = p4_feat.shape[2]           # 8 (128/16)
-            self.p4_w = p4_feat.shape[3]           # 4 (64/16)
+            self.p4_h = p4_feat.shape[2]           # 4 (64/16)
+            self.p4_w = p4_feat.shape[3]           # 2 (32/16)
             
             print(f"[DeFM Backbone] P4 Feature Shape: {p4_feat.shape}")
             print(f"[DeFM Backbone] P4 Channels: {self.p4_channels}, Spatial: {self.p4_h}x{self.p4_w}")
@@ -100,61 +99,58 @@ class DeFMBackbone(nn.Module):
         Forward pass through DeFM backbone.
         
         Args:
-            x: Preprocessed depth tensor of shape (N, 3, 128, 64)
-        
+            x: Preprocessed depth tensor of shape (N, 3, 64, 32)
+
         Returns:
-            P4 features of shape (N, 128, 8, 4) - preserving spatial dimensions
+            P4 features of shape (N, 128, 4, 2) - preserving spatial dimensions
         """
         with torch.no_grad():
             out_dict = self.backbone(x)
             return out_dict["dense_bifpn"]["P4"]
 
 
-def preprocess_depth_grid(
+def _ensure_multicam_layout(
     depth_images: torch.Tensor,
+    num_cameras: int = 4,
+) -> torch.Tensor:
+    """
+    Ensure depth tensor has shape (N, C, H, W), accepting:
+      - (N, C, H, W)
+      - (N, 1, H, C*W) legacy stitched layout
+    """
+    if depth_images.ndim != 4:
+        raise ValueError(f"depth_images must be 4D, got shape {tuple(depth_images.shape)}")
+
+    if depth_images.shape[1] == num_cameras:
+        return depth_images
+
+    # Legacy layout: (N, 1, H, C*W) -> (N, C, H, W)
+    if depth_images.shape[1] == 1 and depth_images.shape[3] % num_cameras == 0:
+        n_batch, _, height, width_total = depth_images.shape
+        cam_width = width_total // num_cameras
+        return depth_images.reshape(n_batch, num_cameras, height, cam_width)
+
+    raise ValueError(
+        f"Unsupported depth layout {tuple(depth_images.shape)}. "
+        f"Expected (N,{num_cameras},H,W) or (N,1,H,{num_cameras}*W)."
+    )
+
+
+def preprocess_depth_independent(
+    depth_images: torch.Tensor,
+    target_size: tuple[int, int] = (64, 32),
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """
-    Preprocess 4 depth images into DeFM format.
-    
-    Takes 4 x 64x32 raw depth images, arranges them into a 2x2 grid (128x64),
-    then applies DeFM's metric-aware 3-channel normalization.
-    
-    Args:
-        depth_images: Raw depth tensor of shape (N, 4, 64, 32) 
-                      where 4 cameras are: [front, right, back, left]
-        device: Target device
-    
-    Returns:
-        Preprocessed tensor of shape (N, 3, 128, 64)
+    Preprocess multi-camera depth images independently to avoid pixel-level stitching artifacts.
     """
-    N = depth_images.shape[0]
-    
-    # Arrange 4 cameras into 2x2 grid
-    # Layout:  front  | right
-    #          -------+-------
-    #          back   | left
-    front = depth_images[:, 0]  # (N, 64, 32)
-    right = depth_images[:, 1]
-    back = depth_images[:, 2]
-    left = depth_images[:, 3]
-    
-    # Create 128x64 grid (H=128, W=64)
-    top_row = torch.cat([front, right], dim=2)     # (N, 64, 64)
-    bottom_row = torch.cat([back, left], dim=2)    # (N, 64, 64)
-    grid = torch.cat([top_row, bottom_row], dim=1) # (N, 128, 64)
-    
-    # Apply DeFM preprocessing (metric-aware 3-channel normalization)
-    # Input: (N, 128, 64) raw metric depth
-    # Output: (N, 3, 128, 64) normalized
-    processed = preprocess_depth_batch(
-        grid,
-        target_size=(128, 64),  # (H, W)
-        cnn_padding=False,
+    depth_images = _ensure_multicam_layout(depth_images, num_cameras=4)
+    processed = defm_preprocess_depth_independent(
+        depth_images=depth_images,
+        target_size=target_size,
         device=device,
     )
-    
-    return processed
+    return processed  # (N*4, 3, H, W)
 
 
 class DeFMPolicy(GaussianMixin, Model):
@@ -162,9 +158,10 @@ class DeFMPolicy(GaussianMixin, Model):
     Policy network using DeFM ResNet18-BiFPN backbone.
     
     Architecture:
-        1. DeFM backbone (frozen) extracts P4 features from depth grid
-        2. MLP combines image features + state -> action mean
-        3. Learnable log_std parameter for Gaussian policy
+        1. DeFM backbone (frozen) extracts single-view P4 features
+        2. Per-camera independent feature compression (no cross-camera spatial mixing)
+        3. MLP combines image features + state -> action mean
+        4. Learnable log_std parameter for Gaussian policy
     """
     
     def __init__(
@@ -240,9 +237,22 @@ class DeFMPolicy(GaussianMixin, Model):
         state_shape = observation_space["state"].shape
         action_shape = action_space.shape
         
-        self.num_cameras = image_shape[0]
-        self.img_height = image_shape[1]
-        self.img_width = image_shape[2]
+        if len(image_shape) != 3:
+            raise ValueError(f"Unsupported image shape: {image_shape}")
+
+        # Preferred layout: (4, H, W). Also accept legacy stitched layout: (1, H, 4W).
+        if image_shape[0] == 4:
+            self.num_cameras = 4
+            self.img_height = image_shape[1]
+            self.img_width = image_shape[2]
+        elif image_shape[0] == 1 and image_shape[2] % 4 == 0:
+            self.num_cameras = 4
+            self.img_height = image_shape[1]
+            self.img_width = image_shape[2] // 4
+        else:
+            raise ValueError(
+                f"DeFMPolicy expects image shape (4,H,W) or (1,H,4W), got {image_shape}"
+            )
         state_dim = state_shape[0]
         action_dim = action_shape[0]
         
@@ -258,16 +268,25 @@ class DeFMPolicy(GaussianMixin, Model):
             freeze=True,
         )
         
-        # 3. Flatten layer: P4 features (N, 128, 8, 4) -> (N, 4096)
-        #    No 1x1 conv, directly flatten P4 features
-        self.flatten = nn.Flatten()
-        p4_feat_dim = self.defm_backbone.p4_channels * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 128*8*4=4096
-        
-        print(f"[DeFM Policy] P4 flatten dim: {p4_feat_dim}")
-        
-        # 4. Define MLP (flattened P4 features + state -> action)
+        # 3. Per-camera feature compression (independent across cameras)
+        # (N*4, 128, 4, 2) -> (N*4, 32, 4, 2) -> flatten
+        self.feature_compression = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self.defm_backbone.p4_channels,
+                out_channels=32,
+                kernel_size=1,
+            ),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        compressed_feat_dim = (
+            self.num_cameras * 32 * self.defm_backbone.p4_h * self.defm_backbone.p4_w
+        )
+        print(f"[DeFM Policy] Compressed feature dim: {compressed_feat_dim}")
+
+        # 4. Define MLP (compressed image features + state -> action)
         self.mlp = nn.Sequential(
-            nn.Linear(p4_feat_dim + state_dim, 512),
+            nn.Linear(compressed_feat_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -288,7 +307,7 @@ class DeFMPolicy(GaussianMixin, Model):
             requires_grad=not fixed_log_std
         )
         
-        print(f"[DeFM Policy] MLP input dim: {p4_feat_dim + state_dim}")
+        print(f"[DeFM Policy] MLP input dim: {compressed_feat_dim + state_dim}")
         print(f"[DeFM Policy] MLP output dim: {action_dim}")
     
     def compute(self, inputs, role=""):
@@ -296,17 +315,26 @@ class DeFMPolicy(GaussianMixin, Model):
         observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
         
         # Get raw depth images and state
-        raw_depth = observations["image"]   # (N, 4, 64, 32)
+        raw_depth = observations["image"]   # expected: (N, 4, 64, 32)
         state = observations["state"]       # (N, state_dim)
-        
+        n_batch = raw_depth.shape[0]
+
         # Backbone forward under no_grad: frozen params don't need gradients,
         # and skipping activation storage saves significant GPU memory.
         with torch.no_grad():
-            processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
-            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 8, 4)
-        
-        # Flatten P4 features (N, 128, 8, 4) -> (N, 4096)
-        img_features = self.flatten(p4_features)
+            processed_depth = preprocess_depth_independent(
+                raw_depth,
+                target_size=(self.img_height, self.img_width),
+                device=raw_depth.device,
+            )
+            p4_features = self.defm_backbone(processed_depth)  # (N*4, 128, 4, 2)
+
+        # 1) Compress each camera feature independently: (N*4, 128, 4, 2) -> (N*4, 256)
+        compressed_features = self.feature_compression(p4_features)
+        # 2) Restore camera dimension: (N*4, 256) -> (N, 4, 256)
+        compressed_features = compressed_features.reshape(n_batch, self.num_cameras, -1)
+        # 3) Flatten 4 cameras into one vector: (N, 4, 256) -> (N, 1024)
+        img_features = compressed_features.reshape(n_batch, -1)
         
         # Combine features and compute action
         combined_features = torch.cat([img_features, state], dim=1)
@@ -320,8 +348,9 @@ class DeFMValue(DeterministicMixin, Model):
     Value network using DeFM ResNet18-BiFPN backbone.
     
     Architecture:
-        1. DeFM backbone (frozen) extracts P4 features from depth grid
-        2. MLP combines image features + state -> scalar value
+        1. DeFM backbone (frozen) extracts single-view P4 features
+        2. Per-camera independent feature compression (no cross-camera spatial mixing)
+        3. MLP combines image features + state -> scalar value
     """
     
     def __init__(
@@ -373,9 +402,22 @@ class DeFMValue(DeterministicMixin, Model):
         image_shape = state_space["image"].shape
         state_shape = state_space["state"].shape
         
-        self.num_cameras = image_shape[0]
-        self.img_height = image_shape[1]
-        self.img_width = image_shape[2]
+        if len(image_shape) != 3:
+            raise ValueError(f"Unsupported image shape: {image_shape}")
+
+        # Preferred layout: (4, H, W). Also accept legacy stitched layout: (1, H, 4W).
+        if image_shape[0] == 4:
+            self.num_cameras = 4
+            self.img_height = image_shape[1]
+            self.img_width = image_shape[2]
+        elif image_shape[0] == 1 and image_shape[2] % 4 == 0:
+            self.num_cameras = 4
+            self.img_height = image_shape[1]
+            self.img_width = image_shape[2] // 4
+        else:
+            raise ValueError(
+                f"DeFMValue expects image shape (4,H,W) or (1,H,4W), got {image_shape}"
+            )
         state_dim = state_shape[0]
         
         print(f"[DeFM Value] Image shape: {image_shape} (cameras, H, W)")
@@ -389,16 +431,24 @@ class DeFMValue(DeterministicMixin, Model):
             freeze=True,
         )
         
-        # 3. Flatten layer: P4 features (N, 128, 8, 4) -> (N, 4096)
-        #    No 1x1 conv, directly flatten P4 features
-        self.flatten = nn.Flatten()
-        p4_feat_dim = self.defm_backbone.p4_channels * self.defm_backbone.p4_h * self.defm_backbone.p4_w  # 128*8*4=4096
-        
-        print(f"[DeFM Value] P4 flatten dim: {p4_feat_dim}")
-        
-        # 4. Define MLP (flattened P4 features + state -> value)
+        # 3. Per-camera feature compression (independent across cameras)
+        self.feature_compression = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self.defm_backbone.p4_channels,
+                out_channels=32,
+                kernel_size=1,
+            ),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        compressed_feat_dim = (
+            self.num_cameras * 32 * self.defm_backbone.p4_h * self.defm_backbone.p4_w
+        )
+        print(f"[DeFM Value] Compressed feature dim: {compressed_feat_dim}")
+
+        # 4. Define MLP (compressed image features + state -> value)
         self.mlp = nn.Sequential(
-            nn.Linear(p4_feat_dim + state_dim, 512),
+            nn.Linear(compressed_feat_dim + state_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
@@ -413,23 +463,29 @@ class DeFMValue(DeterministicMixin, Model):
             nn.Linear(64, 1)  # Output scalar value
         )
         
-        print(f"[DeFM Value] MLP input dim: {p4_feat_dim + state_dim}")
+        print(f"[DeFM Value] MLP input dim: {compressed_feat_dim + state_dim}")
         print(f"[DeFM Value] MLP output dim: 1")
     
     def compute(self, inputs, role=""):
         # Unflatten states (critic uses state_space)
         states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
         
-        raw_depth = states["image"]   # (N, 4, 64, 32)
+        raw_depth = states["image"]   # expected: (N, 4, 64, 32)
         state = states["state"]       # (N, state_dim)
-        
+        n_batch = raw_depth.shape[0]
+
         # Backbone forward under no_grad to save GPU memory
         with torch.no_grad():
-            processed_depth = preprocess_depth_grid(raw_depth, device=raw_depth.device)
-            p4_features = self.defm_backbone(processed_depth)  # (N, 128, 8, 4)
-        
-        # Flatten P4 features (N, 128, 8, 4) -> (N, 4096)
-        img_features = self.flatten(p4_features)
+            processed_depth = preprocess_depth_independent(
+                raw_depth,
+                target_size=(self.img_height, self.img_width),
+                device=raw_depth.device,
+            )
+            p4_features = self.defm_backbone(processed_depth)  # (N*4, 128, 4, 2)
+
+        compressed_features = self.feature_compression(p4_features)
+        compressed_features = compressed_features.reshape(n_batch, self.num_cameras, -1)
+        img_features = compressed_features.reshape(n_batch, -1)
         
         # Combine features and compute value
         combined_features = torch.cat([img_features, state], dim=1)
