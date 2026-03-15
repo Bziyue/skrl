@@ -100,7 +100,14 @@ class Runner:
         )
         # import custom models
         from skrl.models.torch.custom_models import (
-            CNNMLPPolicy, CNNMLPValue
+            AttentionMLPPolicy,
+            AttentionMLPValue,
+            CNNMLPPolicy,
+            CNNMLPValue,
+            CNNAttentionMLPPolicy,
+            CNNAttentionMLPValue,
+            MLPIppoPolicy,
+            MLPIppoValue,
         )
         from skrl.models.torch.custom_models_with_defm import (
             DeFMPolicy, DeFMValue
@@ -120,6 +127,12 @@ class Runner:
             # custom models
             "cnnmlppolicy": CNNMLPPolicy,
             "cnnmlpvalue": CNNMLPValue,
+            "mlpippopolicy": MLPIppoPolicy,
+            "mlpippovalue": MLPIppoValue,
+            "attentionmlppolicy": AttentionMLPPolicy,
+            "attentionmlpvalue": AttentionMLPValue,
+            "cnnattentionmlppolicy": CNNAttentionMLPPolicy,
+            "cnnattentionmlpvalue": CNNAttentionMLPValue,
             "defmpolicy": DeFMPolicy,
             "defmvalue": DeFMValue,
             "defmsrupolicy": DeFMSRUPolicy,
